@@ -1,0 +1,193 @@
+/* ---------------------------------------------------------------
+   Design tokens - Tunisia QoS Platform
+   Two themes (dark default / light) via [data-theme] on <html>.
+   Palette grounded in the domain: signal-strength semantics
+   (cyan=good / amber=marginal / red=poor) drive both KPI colors and
+   the signal-bar rating indicator - not decoration.
+   Type: Space Grotesk (technical/geometric display), Inter (UI body),
+   JetBrains Mono (all numeric/measurement readouts: dBm, %, coords).
+------------------------------------------------------------------*/
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap');
+
+:root,
+[data-theme="dark"] {
+  --bg: #0a0e13;
+  --bg-panel: #121821;
+  --bg-panel-raised: #171f2a;
+  --border: #202b38;
+  --border-soft: #18212c;
+
+  --text-primary: #e7ecef;
+  --text-muted: #7c8a99;
+  --text-faint: #4c5866;
+
+  --signal-good: #33d6c0;
+  --signal-good-dim: #1c4f49;
+  --signal-mid: #f2a93b;
+  --signal-mid-dim: #4d3d1c;
+  --signal-poor: #e5484d;
+  --signal-poor-dim: #4a2023;
+  --signal-none: #2a3542;
+
+  --accent: #33d6c0;
+  --accent-soft: rgba(51, 214, 192, 0.12);
+  --accent-contrast: #06110f;
+
+  --shadow-panel: 0 1px 0 rgba(255,255,255,0.02) inset, 0 8px 24px rgba(0,0,0,0.3);
+  --map-tile-dark: 1;
+}
+
+[data-theme="light"] {
+  --bg: #f7f2ea;
+  --bg-panel: #fdfaf5;
+  --bg-panel-raised: #f1e8da;
+  --border: #e2d5c0;
+  --border-soft: #ece2d1;
+
+  --text-primary: #2b2420;
+  --text-muted: #6b5f52;
+  --text-faint: #a89a86;
+
+  --signal-good: #0891b2;
+  --signal-good-dim: #d3eef3;
+  --signal-mid: #b5760a;
+  --signal-mid-dim: #f3e2c4;
+  --signal-poor: #c2483f;
+  --signal-poor-dim: #f4dcd8;
+  --signal-none: #ddd0bb;
+
+  --accent: #7c3aed;
+  --accent-soft: rgba(124, 58, 237, 0.10);
+  --accent-contrast: #ffffff;
+
+  --shadow-panel: 0 1px 0 rgba(120, 90, 50, 0.04) inset, 0 6px 18px rgba(90, 60, 20, 0.06);
+  --map-tile-dark: 0;
+}
+
+:root {
+  --font-display: 'Space Grotesk', sans-serif;
+  --font-body: 'Inter', sans-serif;
+  --font-mono: 'JetBrains Mono', monospace;
+
+  --radius-sm: 4px;
+  --radius-md: 8px;
+}
+
+* { box-sizing: border-box; }
+
+html, body, #root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text-primary);
+  font-family: var(--font-body);
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+h1, h2, h3, h4 {
+  font-family: var(--font-display);
+  font-weight: 600;
+  margin: 0;
+  letter-spacing: -0.01em;
+}
+
+.mono { font-family: var(--font-mono); }
+
+.eyebrow {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.panel {
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-panel);
+}
+
+button {
+  font-family: var(--font-body);
+  cursor: pointer;
+}
+
+button.btn-primary {
+  background: var(--accent);
+  color: var(--accent-contrast);
+  border: none;
+  border-radius: var(--radius-sm);
+  padding: 9px 16px;
+  font-weight: 600;
+  font-size: 13px;
+  transition: filter 0.15s ease;
+}
+button.btn-primary:hover { filter: brightness(1.1); }
+button.btn-primary:disabled { opacity: 0.4; cursor: not-allowed; }
+
+button.btn-ghost {
+  background: transparent;
+  color: var(--text-muted);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 8px 14px;
+  font-size: 13px;
+  transition: all 0.15s ease;
+}
+button.btn-ghost:hover { color: var(--text-primary); border-color: var(--text-faint); }
+
+button.btn-danger {
+  background: var(--signal-poor-dim);
+  color: var(--signal-poor);
+  border: 1px solid var(--signal-poor);
+  border-radius: var(--radius-sm);
+  padding: 8px 14px;
+  font-size: 13px;
+}
+
+input, select {
+  background: var(--bg-panel-raised);
+  border: 1px solid var(--border);
+  color: var(--text-primary);
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+  font-family: var(--font-body);
+  font-size: 13px;
+}
+input:focus, select:focus, button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+th {
+  text-align: left;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  font-weight: 500;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+}
+td {
+  padding: 12px;
+  border-bottom: 1px solid var(--border-soft);
+  font-family: var(--font-mono);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * { animation: none !important; transition: none !important; }
+}
