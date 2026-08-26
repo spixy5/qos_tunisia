@@ -1,27 +1,25 @@
 """
-Split-by-type raw tables, as required ("test_rsrp", "test_http_attempt",
-"test_http_failure"). Each row keeps:
+Split-by-type raw tables, as required ("test_rsrp", "test_http_attempt").
+Each row keeps:
   - the resolved geo hierarchy (nullable until the spatial join step runs)
   - operator / technology / band for KPI grouping
   - a link back to the UploadedFile it came from (drives archiving + admin delete)
 
-Kept deliberately separate rather than one unified table because the source
-schemas genuinely differ (RSRP has no throughput/protocol fields, failure
-files have a Status/Failure cause the attempt files don't, etc.) - see the
-data inspection notes. A normalized `KPIResult` table (kpi.py) is what
-downstream dashboard/reporting code actually reads from.
+NOTE (schema change): TestHTTPFailure has been removed. The radio team's
+new unified HTTP export carries both successful and failed test rows in a
+single file, distinguished by `test_status`, so a separate failure table
+is no longer needed. The fields from the old failure table that still
+carry useful information (`failure_cause`, `redirect_address`) have been
+folded into TestHTTPAttempt below.
+
+A normalized `KPIResult` table (kpi.py) is what downstream
+dashboard/reporting code actually reads from.
 """
 from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey
 from sqlalchemy.orm import relationship
 from geoalchemy2 import Geometry
 
 from app.database import Base
-
-
-class GeoMixinColumns:
-    """Not a real mixin (SQLAlchemy declarative quirks) - just documents the
-    repeated column set applied identically to all 3 raw tables below."""
-    pass
 
 
 class TestRSRP(Base):
@@ -50,7 +48,9 @@ class TestRSRP(Base):
     # per requirement, technology is NOT derived from the channel lookup,
     # it's whatever was chosen at upload time, kept here "for clarity".
     operator = Column(String(10), nullable=False)
-    technology = Column(String(15), nullable=True)
+    # Widened 10 -> 20: 'Unspecified' (the "Free Tech" upload value) is 11
+    # chars and was getting truncated by Postgres on insert.
+    technology = Column(String(20), nullable=True)
 
     gouvernorat_id = Column(Integer, ForeignKey("ref_gouvernorat.id"), nullable=True)
     delegation_id = Column(Integer, ForeignKey("ref_delegation.id"), nullable=True)
@@ -65,45 +65,39 @@ class TestHTTPAttempt(Base):
     id = Column(Integer, primary_key=True)
     uploaded_file_id = Column(Integer, ForeignKey("uploaded_files.id"), nullable=False)
 
-    event_id = Column(String(10), nullable=True)        # "DAA"
-    time = Column(DateTime, nullable=False)
-    system = Column(String(30), nullable=True)           # "LTE FDD" (old files) or raw code (new files)
-    serving_band = Column(String(10), nullable=True)     # 1800, 2100 ... (frequency band, raw/unresolved)
-    data_transfer_address = Column(String(255), nullable=True)
-    application_protocol = Column(String(20), nullable=True)
-    connection_timeout_ms = Column(Integer, nullable=True)
-    test_end_time = Column(
-    "test_end_time",
-    DateTime,
-    nullable=True,)
+    # Back to `time` - the live DB was restored from a backup that
+    # predates the test_start_time rename, so the ORM has to match what's
+    # actually there again.
+    time = Column("time", DateTime, nullable=False)
+    test_end_time = Column("test_end_time", DateTime, nullable=True)
 
-    end_system_and_band = Column(
-    "end_system_and_band",
-    String(100),
-    nullable=True,)
+    system = Column(String(30), nullable=True)            # "LTE FDD" or raw code
+    serving_band = Column(String(10), nullable=True)       # 1800, 2100 ... (frequency band, raw/unresolved)
+    application_protocol = Column(String(20), nullable=True)
+
+    # Carries success/failure/timeout status for this row. Replaces the old
+    # separate TestHTTPFailure table + implicit "every attempt row is a
+    # success" assumption - both outcomes now live in this one table.
     test_status = Column("test_status", String(100), nullable=True)
 
+    # --- Merged in from the old TestHTTPFailure table ------------------
 
-    # NEW (per the revised HTTP attempt file format): each attempt row now
-    # carries its own RSRP reading + channel + download duration, so TAI
-    # is computed entirely from this table now (no longer from TestRSRP -
-    # see kpi_engine/tai.py). Nullable for backward compatibility with
-    # older-format attempt files that don't have these columns.
+
+    # RSRP/RSCP + channel + duration live directly on the attempt row -
+    # TAI is computed entirely from this table (see kpi_engine/tai.py).
     best_rsrp = Column(Float, nullable=True)
+    best_rscp = Column(Float, nullable=True)   # NEW: 3G equivalent reading, new export only
     channel = Column(Integer, nullable=True)
-    band = Column(String(10), nullable=True)              # resolved via ChannelBandMapping(operator, channel)
-    download_duration_seconds = Column(Float, nullable=True)
-    pci = Column(Integer, nullable=True)
+    band = Column(String(10), nullable=True)   # resolved via ChannelBandMapping(operator, channel)
+    download_duration_seconds = Column(Float, nullable=True)  # computed as test_end_time - test_start_time
 
     latitude = Column(Float, nullable=False)
     longitude = Column(Float, nullable=False)
     geom = Column(Geometry(geometry_type="POINT", srid=4326), nullable=True)
 
     operator = Column(String(10), nullable=False)
-    technology = Column(String(15), nullable=True)
-    # NOTE: no is_success flag needed - every http_attempt row IS a success
-    # by definition (see kpi_engine/tao.py for the evidence). Failed tests
-    # land in TestHTTPFailure instead, never both.
+    # Widened 10 -> 20, same reason as TestRSRP.technology above.
+    technology = Column(String(20), nullable=True)
 
     gouvernorat_id = Column(Integer, ForeignKey("ref_gouvernorat.id"), nullable=True)
     delegation_id = Column(Integer, ForeignKey("ref_delegation.id"), nullable=True)
@@ -111,37 +105,6 @@ class TestHTTPAttempt(Base):
 
     uploaded_file = relationship("UploadedFile")
 
-
-class TestHTTPFailure(Base):
-    __tablename__ = "test_http_failure"
-
-    id = Column(Integer, primary_key=True)
-    uploaded_file_id = Column(Integer, ForeignKey("uploaded_files.id"), nullable=False)
-
-    event_id = Column(String(10), nullable=True)         # "DAF"
-    event_label = Column(String(50), nullable=True)       # "HTTP failure"
-    event_number = Column(Integer, nullable=True)
-    measurement = Column(String(50), nullable=True)       # "test_http_4g.1"
-    time = Column(DateTime, nullable=False)
-    system = Column(String(30), nullable=True)
-    serving_band = Column(String(10), nullable=True)
-    data_transfer_address = Column(String(255), nullable=True)
-    redirect_address = Column(String(255), nullable=True)
-    application_protocol = Column(String(20), nullable=True)
-    status = Column(String(100), nullable=True)
-    failure_cause = Column(String(100), nullable=True)
-
-    latitude = Column(Float, nullable=False)
-    longitude = Column(Float, nullable=False)
-    geom = Column(Geometry(geometry_type="POINT", srid=4326), nullable=True)
-
-    operator = Column(String(10), nullable=False)
-    technology = Column(String(15), nullable=True)
-    # NOTE: no matched_attempt_id needed - failure rows are standalone failed
-    # test events, not duplicates of an attempt row requiring a join.
-
-    gouvernorat_id = Column(Integer, ForeignKey("ref_gouvernorat.id"), nullable=True)
-    delegation_id = Column(Integer, ForeignKey("ref_delegation.id"), nullable=True)
-    secteur_id = Column(Integer, ForeignKey("ref_secteur.id"), nullable=True)
-
-    uploaded_file = relationship("UploadedFile")
+    # Dropped vs the old model: event_id, data_transfer_address,
+    # connection_timeout_ms, pci, end_system_and_band - all were only
+    # populated by old-format exports that no longer need supporting.

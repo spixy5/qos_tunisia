@@ -17,7 +17,7 @@ Therefore:
 
 where:
 
-    duration_seconds = test_end_time - time
+    duration_seconds = test_end_time - test_start_time
 
 The comparison is strictly:
 
@@ -76,6 +76,10 @@ class TDKpi(BaseKPI):
             TestHTTPAttempt.operator == context.operator,
             TestHTTPAttempt.technology == context.technology,
 
+            # Reverted: the live DB is back on `time`, not
+            # `test_start_time` (restored from a backup that predates
+            # that rename) - this filter and the duration calc below
+            # both need to match.
             TestHTTPAttempt.time.is_not(None),
             TestHTTPAttempt.test_end_time.is_not(None),
 

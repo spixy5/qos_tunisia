@@ -16,7 +16,9 @@ For each HTTP attempt:
        - same secteur
        - same operator
        - same band
-       - same position
+       - "same position" means within POSITION_TOLERANCE_METERS (see
+         below), using the existing geom columns via ST_DWithin
+         (geography cast, so the distance is in real meters, not degrees).
        - within +/- 1 second
 4. If several RSRP rows match, choose the closest in time.
 5. Get taux_aff and tai_threshold from config_band_thresholds.
@@ -44,6 +46,7 @@ from app.kpi_engine.base import (
     register_kpi,
 )
 
+POSITION_TOLERANCE_METERS = 30
 
 _QUERY = text("""
     WITH matched AS (
@@ -69,14 +72,24 @@ _QUERY = text("""
               -- Operator must match
               AND r.operator = ha.operator
 
-              -- HTTP serving_band must match RSRP band
-              AND r.band = ha.serving_band
+              -- HTTP serving_band must match RSRP band, tolerant of
+              -- either the prefixed ('L1800') or bare ('1800') convention.
+              AND regexp_replace(r.band, '^[^0-9]*', '') = regexp_replace(ha.serving_band, '^[^0-9]*', '')
 
-              -- Same geographic position
-              AND r.latitude = ha.latitude
-              AND r.longitude = ha.longitude
+              -- "same position" via real distance instead of exact float
+              -- equality - geom is already a geography-castable PostGIS
+              -- column on both tables, ST_DWithin uses the spatial index
+              -- if present.
+              AND ST_DWithin(
+                    r.geom::geography,
+                    ha.geom::geography,
+                    :position_tolerance_m
+              )
 
               -- Time matching window
+              -- REVERTED: back to ha.time (not ha.test_start_time) - the
+              -- live DB was restored from a backup that predates that
+              -- rename, so TestHTTPAttempt.time is the real column again.
               AND r.time BETWEEN
                     ha.time - INTERVAL '1 second'
                 AND ha.time + INTERVAL '1 second'
@@ -93,6 +106,11 @@ _QUERY = text("""
         WHERE ha.secteur_id = :secteur_id
           AND ha.operator = :operator
           AND ha.technology = :technology
+          -- Skip rows with no recorded test_status entirely (both
+          -- numerator and denominator) instead of counting them as
+          -- failures. These are pre-migration/legacy rows that never had
+          -- this field at all - there's no real "outcome" to judge.
+          AND ha.test_status IS NOT NULL
     )
 
     SELECT
@@ -113,7 +131,7 @@ _QUERY = text("""
     FROM matched m
 
     LEFT JOIN config_band_thresholds bt
-        ON bt.band = m.serving_band
+        ON regexp_replace(bt.band, '^[^0-9]*', '') = regexp_replace(m.serving_band, '^[^0-9]*', '')
 """)
 
 
@@ -129,6 +147,7 @@ class TAIKpi(BaseKPI):
                 "secteur_id": context.secteur_id,
                 "operator": context.operator,
                 "technology": context.technology,
+                "position_tolerance_m": POSITION_TOLERANCE_METERS,
             },
         ).one()
 

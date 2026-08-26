@@ -9,7 +9,10 @@ from app.auth.dependencies import get_current_user
 from app.models.user import User
 from app.models.geo import Gouvernorat, Delegation, Secteur
 from app.models.kpi import KPIResult, KPIName
-from app.models.raw_data import TestRSRP, TestHTTPAttempt, TestHTTPFailure
+# CHANGED: TestHTTPFailure no longer exists - failure rows now live inside
+# TestHTTPAttempt itself (test_status = "Success"/"Fail"), per the new
+# unified "Home operator" export format.
+from app.models.raw_data import TestRSRP, TestHTTPAttempt
 from app.models.config_models import BandThreshold
 from app.schemas.schemas import GouvernoratOut, DelegationOut, SecteurOut, \
     LocationOverviewResponse, DelegationOverviewResponse, OperatorComparisonRow
@@ -27,10 +30,6 @@ def _band_threshold(db: Session, band: str | None) -> BandThreshold | None:
     return db.query(BandThreshold).filter_by(band=band).one_or_none()
 
 
-# ---- Area signal quality (replaces individual point plotting - one
-# aggregate red->green percentage per selected boundary, based on the same
-# RSRP + Taux_aff > seuil rule as TAI, optionally scoped to one operator) ----
-
 @router.get("/area-quality")
 def area_quality(level: str = Query(..., pattern="^(gouvernorat|delegation|secteur)$"),
                   id: int = Query(...), operator: str | None = Query(None),
@@ -45,11 +44,6 @@ def area_quality(level: str = Query(..., pattern="^(gouvernorat|delegation|secte
     if operator and operator != "ALL":
         base_filters.append(TestRSRP.operator == operator)
 
-    # Threshold is per-BAND now (not per operator+technology), and a row's
-    # band is independent of its operator/technology grouping - so we
-    # group straight by band across all matching rows, same exclusion
-    # policy as TAI: rows with band=None (unmapped channel) are excluded
-    # from both numerator and denominator.
     bands_present = (
         db.query(TestRSRP.band).filter(*base_filters, TestRSRP.band.is_not(None)).distinct().all()
     )
@@ -76,10 +70,6 @@ def area_quality(level: str = Query(..., pattern="^(gouvernorat|delegation|secte
         "quality_pct": quality_pct, "sample_count": total_all,
     }
 
-
-# ---- RSRP trend over time (line chart) - averaged into hour or day
-# buckets so a drive-test campaign's thousands of raw points render as a
-# readable trend line rather than a scatter of noise ----
 
 @router.get("/rsrp-trend")
 def rsrp_trend(level: str = Query(..., pattern="^(gouvernorat|delegation|secteur)$"),
@@ -110,12 +100,12 @@ def rsrp_trend(level: str = Query(..., pattern="^(gouvernorat|delegation|secteur
     ]
 
 
-# ---- Raw log drill-down (union of RSRP + HTTP attempt + HTTP failure
-# rows, each tagged by log type). This is the HONEST shape of the real
-# data: a row never has both an RSRP reading AND an HTTP status at once,
-# since those are genuinely separate measurement events (no per-row join
-# exists between them - see kpi_engine/tai.py for why). failure_cause is
-# printed verbatim rather than bucketed into synthetic categories. ----
+# ---- Raw log drill-down (union of RSRP + HTTP attempt rows, each tagged
+# by log type). CHANGED: there is no separate http_failure table anymore -
+# a "Fail" HTTP result is a TestHTTPAttempt row with test_status = "Fail"
+# rather than a different table. log_type still accepts "http_failure" as
+# a query value (so the frontend doesn't need to change) but it's now
+# just an alias meaning "http_attempt rows where test_status = Fail". ----
 
 @router.get("/raw-logs")
 def raw_logs(level: str = Query(..., pattern="^(gouvernorat|delegation|secteur)$"),
@@ -127,19 +117,12 @@ def raw_logs(level: str = Query(..., pattern="^(gouvernorat|delegation|secteur)$
     """
     IMPORTANT: result/log_type filtering happens HERE (server-side, per
     operator+technology threshold combo) rather than being applied
-    client-side after an arbitrary "most recent N rows" fetch. The
-    previous version capped each log type at limit/3 ordered by recency
-    regardless of pass/fail, so filtering to "Echec" client-side only ever
-    searched a small recent slice - producing a much smaller count than
-    the map's bad-rsrp-points endpoint (which scans everything). This
-    version makes the two counts consistent by construction.
+    client-side after an arbitrary "most recent N rows" fetch.
     """
     rsrp_fk = {"gouvernorat": TestRSRP.gouvernorat_id, "delegation": TestRSRP.delegation_id,
                "secteur": TestRSRP.secteur_id}[level]
     attempt_fk = {"gouvernorat": TestHTTPAttempt.gouvernorat_id, "delegation": TestHTTPAttempt.delegation_id,
                   "secteur": TestHTTPAttempt.secteur_id}[level]
-    failure_fk = {"gouvernorat": TestHTTPFailure.gouvernorat_id, "delegation": TestHTTPFailure.delegation_id,
-                  "secteur": TestHTTPFailure.secteur_id}[level]
 
     secteur_cache: dict[int, str | None] = {}
 
@@ -151,11 +134,12 @@ def raw_logs(level: str = Query(..., pattern="^(gouvernorat|delegation|secteur)$
             secteur_cache[sid] = s.name if s else None
         return secteur_cache[sid]
 
-    # attempt rows are always Pass, failure rows are always Fail - skip
-    # querying them entirely if the requested result/log_type rules them out
     want_rsrp = log_type in (None, "rsrp")
-    want_attempt = log_type in (None, "http_attempt") and result in (None, "Pass")
-    want_failure = log_type in (None, "http_failure") and result in (None, "Fail")
+    # CHANGED: attempt rows can now be Pass OR Fail (test_status), so this
+    # branch is the only source of Fail rows now. "http_failure" is
+    # treated as an alias for "http_attempt rows with test_status = Fail"
+    # so old frontend query params keep working unchanged.
+    want_attempt = log_type in (None, "http_attempt", "http_failure")
 
     results = []
 
@@ -163,9 +147,6 @@ def raw_logs(level: str = Query(..., pattern="^(gouvernorat|delegation|secteur)$
         base_filters = [rsrp_fk == id]
         if operator and operator != "ALL":
             base_filters.append(TestRSRP.operator == operator)
-        # Rows with no resolved band (unmapped channel) can't be judged
-        # against any threshold - excluded here too, consistent with
-        # TAI/area-quality's exclusion policy.
         base_filters.append(TestRSRP.band.is_not(None))
 
         combos = db.query(TestRSRP.operator, TestRSRP.technology, TestRSRP.band).filter(*base_filters).distinct().all()
@@ -199,36 +180,27 @@ def raw_logs(level: str = Query(..., pattern="^(gouvernorat|delegation|secteur)$
             attempt_q = db.query(TestHTTPAttempt).filter(attempt_fk == id)
             if operator and operator != "ALL":
                 attempt_q = attempt_q.filter(TestHTTPAttempt.operator == operator)
+            # CHANGED: filter by test_status instead of assuming every
+            # attempt row is a Pass.
+            if result == "Pass":
+                attempt_q = attempt_q.filter(func.lower(func.trim(TestHTTPAttempt.test_status)) == "success")
+            elif result == "Fail" or log_type == "http_failure":
+                attempt_q = attempt_q.filter(func.lower(func.trim(TestHTTPAttempt.test_status)) == "fail")
+
             for r in attempt_q.order_by(TestHTTPAttempt.time.desc()).limit(remaining).all():
+                is_success = (r.test_status or "").strip().lower() == "success"
                 results.append({
                     "id": f"attempt_{r.id}", "logType": "http_attempt",
                     "timestamp": r.time.strftime("%Y-%m-%d %H:%M:%S"),
                     "operator": r.operator, "technology": r.technology, "secteurName": secteur_name(r.secteur_id),
-                    "rsrp": None, "httpStatusLabel": "Succes", "result": "Pass",
-                })
-
-    if want_failure:
-        remaining = limit - len(results)
-        if remaining > 0:
-            failure_q = db.query(TestHTTPFailure).filter(failure_fk == id)
-            if operator and operator != "ALL":
-                failure_q = failure_q.filter(TestHTTPFailure.operator == operator)
-            for r in failure_q.order_by(TestHTTPFailure.time.desc()).limit(remaining).all():
-                results.append({
-                    "id": f"failure_{r.id}", "logType": "http_failure",
-                    "timestamp": r.time.strftime("%Y-%m-%d %H:%M:%S"),
-                    "operator": r.operator, "technology": r.technology, "secteurName": secteur_name(r.secteur_id),
-                    "rsrp": None, "httpStatusLabel": r.failure_cause or r.status or "Echec (cause inconnue)",
-                    "result": "Fail",
+                    "rsrp": None,
+                    "httpStatusLabel": "Succes" if is_success else (r.test_status or "Echec (cause inconnue)"),
+                    "result": "Pass" if is_success else "Fail",
                 })
 
     results.sort(key=lambda x: x["timestamp"], reverse=True)
     return results[:limit]
 
-
-# ---- Individual "bad" RSRP points (failing best_rsrp+Taux_aff>seuil) for
-# the selected area - overlaid as markers on top of the area-quality fill
-# so poor-coverage spots can be pinpointed, not just the aggregate % ----
 
 @router.get("/bad-rsrp-points")
 def bad_rsrp_points(level: str = Query(..., pattern="^(gouvernorat|delegation|secteur)$"),
@@ -277,8 +249,6 @@ def bad_rsrp_points(level: str = Query(..., pattern="^(gouvernorat|delegation|se
     return points[:limit]
 
 
-# ---- Cascading location dropdowns ----
-
 @router.get("/gouvernorats", response_model=list[GouvernoratOut])
 def list_gouvernorats(db: Session = Depends(get_db), _: User = Depends(get_current_user)):
     return db.query(Gouvernorat).order_by(Gouvernorat.name).all()
@@ -296,8 +266,6 @@ def list_secteurs(delegation_id: int = Query(...), db: Session = Depends(get_db)
     return db.query(Secteur).filter_by(delegation_id=delegation_id).order_by(Secteur.name).all()
 
 
-# ---- Map: GeoJSON boundary for the selected level (for highlighting) ----
-
 @router.get("/boundary")
 def get_boundary(level: str = Query(..., pattern="^(gouvernorat|delegation|secteur)$"),
                   id: int = Query(...), db: Session = Depends(get_db),
@@ -314,9 +282,6 @@ def get_boundary(level: str = Query(..., pattern="^(gouvernorat|delegation|secte
         "geometry": mapping(shapely_geom),
     }
 
-
-# ---- Delegation-level aggregate (average across every secteur in the
-# delegation that has computed KPIs, per operator+technology) ----
 
 @router.get("/delegation-overview", response_model=DelegationOverviewResponse)
 def delegation_overview(delegation_id: int = Query(...), db: Session = Depends(get_db),
@@ -364,8 +329,6 @@ def delegation_overview(delegation_id: int = Query(...), db: Session = Depends(g
     )
 
 
-# ---- Location Performance Overview (rating card + operator comparison table) ----
-
 @router.get("/location-overview", response_model=LocationOverviewResponse)
 def location_overview(secteur_id: int = Query(...), db: Session = Depends(get_db),
                        _: User = Depends(get_current_user)):
@@ -377,7 +340,6 @@ def location_overview(secteur_id: int = Query(...), db: Session = Depends(get_db
     pcps_values: list[float] = []
 
     kpi_rows = db.query(KPIResult).filter_by(secteur_id=secteur_id).all()
-    # group by (operator, technology)
     grouped: dict[tuple[str, str | None], dict[str, KPIResult]] = {}
     for row in kpi_rows:
         key = (row.operator, row.technology)
@@ -407,8 +369,6 @@ def location_overview(secteur_id: int = Query(...), db: Session = Depends(get_db
         overall_rating=overall_rating, comparison=comparison,
     )
 
-
-# ---- Map points colored by KPI/QoS status (for the interactive map layer) ----
 
 @router.get("/map-points")
 def map_points(kpi_name: str = Query("PCPS", pattern="^(TAO|TAI|TD|PCPS)$"),

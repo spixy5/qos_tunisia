@@ -36,6 +36,7 @@ class TAOKpi(BaseKPI):
             TestHTTPAttempt.secteur_id == context.secteur_id,
             TestHTTPAttempt.operator == context.operator,
             TestHTTPAttempt.technology == context.technology,
+            TestHTTPAttempt.test_status.is_not(None),
         ]
 
         # Total HTTP outdoor measurements

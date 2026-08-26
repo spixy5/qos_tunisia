@@ -8,7 +8,8 @@ from app.models.user import User
 from app.models.config_models import BandThreshold, TechnologyThreshold, ChannelBandMapping, \
     DownloadDurationThreshold
 from app.models.uploaded_file import UploadedFile
-from app.models.raw_data import TestRSRP, TestHTTPAttempt, TestHTTPFailure
+# CHANGED: TestHTTPFailure removed (merged into TestHTTPAttempt)
+from app.models.raw_data import TestRSRP, TestHTTPAttempt
 from app.models.geo import Gouvernorat, Delegation, Secteur
 from app.archiving.file_archiver import delete_archived_file
 from app.kpi_engine.engine import run_kpi_engine
@@ -112,9 +113,10 @@ def list_channel_bands(db: Session = Depends(get_db), _: User = Depends(require_
 # tables, which is the authoritative signal of where real data lives,
 # distinct from a file's single majority-sector archive location) ----
 
+# CHANGED: only 2 raw tables now (TestHTTPFailure merged into TestHTTPAttempt)
 def _secteur_ids_with_data(db: Session) -> set[int]:
     ids: set[int] = set()
-    for model in (TestRSRP, TestHTTPAttempt, TestHTTPFailure):
+    for model in (TestRSRP, TestHTTPAttempt):
         rows = db.execute(select(model.secteur_id).where(model.secteur_id.is_not(None)).distinct()).scalars().all()
         ids.update(rows)
     return ids
@@ -198,7 +200,14 @@ def recompute_kpis(db: Session = Depends(get_db), _: User = Depends(require_admi
 
 # ---- Data deletion ----
 
-RAW_MODELS_BY_TYPE = {"rsrp": TestRSRP, "http_attempt": TestHTTPAttempt, "http_failure": TestHTTPFailure}
+# CHANGED: "http_failure" removed - that log_type no longer has its own
+# table/model. If UploadedFile.log_type still has an "http_failure" enum
+# value left over from before the migration, a delete-by-file-path or
+# delete-by-site call against an old http_failure record will now raise
+# a KeyError here rather than silently doing nothing - which is the
+# correct behavior (surfacing the stale record) rather than pretending
+# to support a log type that no longer exists.
+RAW_MODELS_BY_TYPE = {"rsrp": TestRSRP, "http_attempt": TestHTTPAttempt}
 
 
 @router.delete("/data/by-file-path")
@@ -222,10 +231,11 @@ def delete_by_file_path(payload: DeleteByFilePathRequest, db: Session = Depends(
 @router.delete("/data/by-site")
 def delete_by_site(payload: DeleteBySiteRequest, db: Session = Depends(get_db),
                     _: User = Depends(require_admin)):
-    """Deletes all measurement rows (all 3 raw tables) for a given Secteur
+    """Deletes all measurement rows (both raw tables) for a given Secteur
     (Site Name = adm4_name, per agreed definition)."""
     total_deleted = 0
-    for model_cls in (TestRSRP, TestHTTPAttempt, TestHTTPFailure):
+    # CHANGED: only 2 raw tables now
+    for model_cls in (TestRSRP, TestHTTPAttempt):
         total_deleted += db.query(model_cls).filter_by(secteur_id=payload.secteur_id).delete()
 
     db.commit()

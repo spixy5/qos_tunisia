@@ -6,7 +6,7 @@ Orchestrates the full automated pipeline triggered by a single file upload:
   3. Spatial join (spatial_mapping/spatial_join.py) - resolve gouvernorat/
      delegation/secteur per row
   4. Insert cleaned+joined rows into the appropriate split table
-     (test_rsrp / test_http_attempt / test_http_failure)
+     (test_rsrp / test_http_attempt)
   5. Archive a copy of the ORIGINAL raw file under the majority-sector path
   6. Re-run the KPI engine for affected combinations
 
@@ -34,38 +34,32 @@ from app.spatial_mapping.spatial_join import spatial_join_points, majority_secte
 from app.archiving.file_archiver import archive_file
 from app.models.uploaded_file import UploadedFile, LogType
 from app.models.geo import Secteur
-from app.models.raw_data import TestRSRP, TestHTTPAttempt, TestHTTPFailure
+from app.models.raw_data import TestRSRP, TestHTTPAttempt
 
 logger = logging.getLogger(__name__)
 
 ROW_MODEL = {
     "rsrp": TestRSRP,
     "http_attempt": TestHTTPAttempt,
-    "http_failure": TestHTTPFailure,
 }
 
 RSRP_COLS = ["time", "best_rsrp", "channel", "band", "dl_bw", "pci", "to_interval",
              "latitude", "longitude", "operator", "technology",
              "secteur_id", "delegation_id", "gouvernorat_id"]  # gouvernorat_id/delegation_id filled below
 HTTP_ATTEMPT_COLS = [
-    "event_id",
     "time",
+    "test_end_time",
     "system",
     "serving_band",
-    "data_transfer_address",
     "application_protocol",
-    "connection_timeout_ms",
-
-    # NEW HTTP fields
     "test_status",
-    "test_end_time",
-    "end_system_and_band",
-
+    "download_duration_seconds",
     "best_rsrp",
+    "best_rscp",
     "channel",
     "band",
-    "download_duration_seconds",
-    "pci",
+    "redirect_address",
+    "failure_cause",
     "latitude",
     "longitude",
     "operator",
@@ -74,12 +68,10 @@ HTTP_ATTEMPT_COLS = [
     "delegation_id",
     "gouvernorat_id",
 ]
-HTTP_FAILURE_COLS = ["event_id", "event_label", "event_number", "measurement", "time", "system",
-                      "serving_band", "data_transfer_address", "redirect_address",
-                      "application_protocol", "status", "failure_cause", "latitude", "longitude",
-                      "operator", "technology", "secteur_id", "delegation_id", "gouvernorat_id"]
 
-COLS_BY_TYPE = {"rsrp": RSRP_COLS, "http_attempt": HTTP_ATTEMPT_COLS, "http_failure": HTTP_FAILURE_COLS}
+COLS_BY_TYPE = {"rsrp": RSRP_COLS, "http_attempt": HTTP_ATTEMPT_COLS}
+
+_HTTP_DEBUG_PREVIEW_COLS = ["test_status", "test_end_time", "download_duration_seconds"]
 
 
 def _attach_gouvernorat_delegation_ids(df: pd.DataFrame, db: Session) -> pd.DataFrame:
@@ -113,48 +105,28 @@ def process_upload(db: Session, temp_file_path: Path, original_filename: str,
     df = parse_uploaded_file(temp_file_path, log_type, operator, technology)
     raw_rows = len(df)
 
-    # 1b. Resolve band per row for RSRP and HTTP attempt uploads (channel ->
-    # band, per operator; independent of the technology field - see
-    # channel_band_lookup.py). Unmapped channels get band=None, row is kept.
-    # HTTP attempt files may or may not carry a `channel` column depending
-    # on format (see parsers.py) - attach_band_column no-ops gracefully if
-    # it's absent (older-format attempt files).
     if log_type in ("rsrp", "http_attempt"):
         df = attach_band_column(df, operator, db)
 
-
-    #hatta hetha test
     logger.info(
-    "BEFORE CLEAN HTTP columns: %s",
-    df.columns.tolist()
+        "BEFORE CLEAN HTTP columns: %s",
+        df.columns.tolist()
     )
 
     if log_type == "http_attempt":
-        # Not every HTTP attempt format produces all three of these columns
-        # (e.g. files without "End system and band" won't have
-        # end_system_and_band) - only select whichever are actually present
-        # so this debug log doesn't crash the upload on files missing one.
-        debug_cols = [
-            c for c in ("test_status", "test_end_time", "end_system_and_band")
-            if c in df.columns
-        ]
+        preview_cols = [c for c in _HTTP_DEBUG_PREVIEW_COLS if c in df.columns]
         logger.info(
             "BEFORE CLEAN HTTP VALUES:\n%s",
-            df[debug_cols].head(10).to_string()
+            df[preview_cols].head(10).to_string()
         )
     # 2. Clean
     df, clean_stats = clean_dataframe(df)
-    #w hata hetha test
     if log_type == "http_attempt":
-        debug_cols = [
-            c for c in ("test_status", "test_end_time", "end_system_and_band")
-            if c in df.columns
-        ]
+        preview_cols = [c for c in _HTTP_DEBUG_PREVIEW_COLS if c in df.columns]
         logger.info(
             "AFTER CLEAN HTTP VALUES:\n%s",
-            df[debug_cols].head(10).to_string()
+            df[preview_cols].head(10).to_string()
         )
-
 
     # 3. Spatial join
     if not df.empty:
@@ -176,17 +148,11 @@ def process_upload(db: Session, temp_file_path: Path, original_filename: str,
         uploaded_by_user_id=uploaded_by_user_id,
     )
     db.add(uploaded_file)
-    db.flush()  # get uploaded_file.id
+    db.flush()
 
     # 5. Insert cleaned+joined rows into the correct split table
     model_cls = ROW_MODEL[log_type]
     keep_cols = [c for c in COLS_BY_TYPE[log_type] if c in df.columns]
-    # NOTE: .astype(object) before .where() is required - without it, pandas
-    # silently keeps NaN (a float) instead of a real None for nullable
-    # columns (confirmed on http_failure's `redirect_address`: 6 genuinely
-    # empty rows came back as float('nan') rather than None). Inserting a
-    # raw NaN into a String column makes psycopg reject the whole batch,
-    # which is why uploads could fail with zero rows landing in the DB.
     records = df[keep_cols].astype(object).where(pd.notnull(df[keep_cols]), None).to_dict(orient="records")
     for rec in records:
         rec["uploaded_file_id"] = uploaded_file.id
