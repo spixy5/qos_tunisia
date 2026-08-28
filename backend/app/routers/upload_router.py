@@ -14,7 +14,7 @@ from app.schemas.schemas import UploadResponse
 
 router = APIRouter(prefix="/admin/upload", tags=["admin-upload"])
 
-ALLOWED_LOG_TYPES = {"rsrp", "http_attempt", "http_failure"}
+ALLOWED_LOG_TYPES = {"rsrp", "http_attempt"}
 ALLOWED_OPERATORS = {"TT", "OO", "OR"}
 ALLOWED_TECHNOLOGIES = {"4G", "4G_3G", "5G", "Unspecified"}
 

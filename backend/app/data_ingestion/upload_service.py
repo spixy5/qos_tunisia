@@ -12,14 +12,7 @@ Orchestrates the full automated pipeline triggered by a single file upload:
 
 Steps 1-5 happen synchronously in this function; step 6 is left as an
 explicit follow-up call from the router so a slow KPI recompute doesn't
-block the upload response (kept simple/synchronous here - swap for a
-background task queue like Celery/RQ if upload volume grows).
-
-NOTE: there is deliberately no attempt<->failure matching step here.
-Inspection of the real sample files showed http_attempt and http_failure
-are not duplicate logs needing a join - each test cycle produces exactly
-one row in one of the two files (see kpi_engine/tao.py for the evidence).
-TAO/TAI compute directly from row counts in the two tables.
+block the upload response.
 """
 import logging
 from pathlib import Path
@@ -43,11 +36,23 @@ ROW_MODEL = {
     "http_attempt": TestHTTPAttempt,
 }
 
-RSRP_COLS = ["time", "best_rsrp", "channel", "band", "dl_bw", "pci", "to_interval",
-             "latitude", "longitude", "operator", "technology",
-             "secteur_id", "delegation_id", "gouvernorat_id"]  # gouvernorat_id/delegation_id filled below
+# CHANGED: added rscp/sc - both exist on the model and are produced by
+# the parser, but were missing from this list, so they were silently
+# never being inserted despite being present in every RSRP row's data.
+RSRP_COLS = [
+    "time", "best_rsrp", "channel", "band", "dl_bw", "pci", "to_interval",
+    "rscp", "sc",
+    "latitude", "longitude", "operator", "technology",
+    "secteur_id", "delegation_id", "gouvernorat_id",
+]
+
+# CHANGED: test_http_attempt no longer has channel/band/redirect_address/
+# failure_cause at all (see models.py) - keeping them here was harmless
+# only because `keep_cols` filters to columns present in the dataframe,
+# but it's misleading to list columns that don't exist on the table.
+# Also: "time" -> "test_start_time" to match the actual column name.
 HTTP_ATTEMPT_COLS = [
-    "time",
+    "test_start_time",
     "test_end_time",
     "system",
     "serving_band",
@@ -56,10 +61,6 @@ HTTP_ATTEMPT_COLS = [
     "download_duration_seconds",
     "best_rsrp",
     "best_rscp",
-    "channel",
-    "band",
-    "redirect_address",
-    "failure_cause",
     "latitude",
     "longitude",
     "operator",
@@ -75,9 +76,6 @@ _HTTP_DEBUG_PREVIEW_COLS = ["test_status", "test_end_time", "download_duration_s
 
 
 def _attach_gouvernorat_delegation_ids(df: pd.DataFrame, db: Session) -> pd.DataFrame:
-    """spatial_join_points resolves secteur_id/name + delegation_name/gouvernorat_name
-    (strings). Raw tables store FK ids for gouvernorat/delegation too, so resolve
-    those ids here via the Secteur -> Delegation -> Gouvernorat chain, keyed by secteur_id."""
     if "secteur_id" not in df.columns:
         df["delegation_id"] = None
         df["gouvernorat_id"] = None
@@ -105,13 +103,14 @@ def process_upload(db: Session, temp_file_path: Path, original_filename: str,
     df = parse_uploaded_file(temp_file_path, log_type, operator, technology)
     raw_rows = len(df)
 
-    if log_type in ("rsrp", "http_attempt"):
+    # CHANGED: only rsrp has channel/band to resolve now - test_http_attempt
+    # dropped both columns entirely, so calling this for "http" was dead
+    # weight (or worse, relied on it silently no-op'ing on a missing
+    # `channel` column).
+    if log_type == "rsrp":
         df = attach_band_column(df, operator, db)
 
-    logger.info(
-        "BEFORE CLEAN HTTP columns: %s",
-        df.columns.tolist()
-    )
+    logger.info("BEFORE CLEAN %s columns: %s", log_type, df.columns.tolist())
 
     if log_type == "http_attempt":
         preview_cols = [c for c in _HTTP_DEBUG_PREVIEW_COLS if c in df.columns]
@@ -119,8 +118,10 @@ def process_upload(db: Session, temp_file_path: Path, original_filename: str,
             "BEFORE CLEAN HTTP VALUES:\n%s",
             df[preview_cols].head(10).to_string()
         )
+
     # 2. Clean
     df, clean_stats = clean_dataframe(df)
+
     if log_type == "http_attempt":
         preview_cols = [c for c in _HTTP_DEBUG_PREVIEW_COLS if c in df.columns]
         logger.info(

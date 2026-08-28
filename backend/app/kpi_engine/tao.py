@@ -1,19 +1,3 @@
-"""
-TAO = Taux d'Accessibilite Internet Outdoor
-
-TAO = (successful HTTP measurements / total HTTP measurements) * 100
-
-For the new HTTP format:
-    Test status = "Success"  -> successful measurement
-    Any other status          -> failed measurement
-
-The KPI is calculated independently for:
-    (secteur, operator, technology)
-
-TestHTTPFailure is NOT used for TAO because success/failure is now
-explicitly represented by TestHTTPAttempt.test_status.
-"""
-
 from sqlalchemy import select, func
 
 from app.kpi_engine.base import (
@@ -36,7 +20,8 @@ class TAOKpi(BaseKPI):
             TestHTTPAttempt.secteur_id == context.secteur_id,
             TestHTTPAttempt.operator == context.operator,
             TestHTTPAttempt.technology == context.technology,
-            TestHTTPAttempt.test_status.is_not(None),
+            TestHTTPAttempt.test_start_time.is_not(None),
+            TestHTTPAttempt.test_end_time.is_not(None),
         ]
 
         # Total HTTP outdoor measurements
@@ -52,12 +37,15 @@ class TAOKpi(BaseKPI):
                 is_computed=False,
             )
 
-        # Successful HTTP measurements
+        # Successful HTTP measurements: difference between end time and start time < 10 seconds
+        time_diff = func.extract(
+            "epoch", TestHTTPAttempt.test_end_time - TestHTTPAttempt.test_start_time
+        )
+
         success = db.execute(
             select(func.count(TestHTTPAttempt.id)).where(
                 *filters,
-                func.lower(func.trim(TestHTTPAttempt.test_status))
-                == "success",
+                time_diff < 10,
             )
         ).scalar_one()
 

@@ -1,33 +1,21 @@
 """
-TD = Taux de Debit Conforme
+TD = Taux de Debit Conforme (per INT Decision Coll/Reg/2025/16, Annexe A section 2.2.1)
 
 TD =
-    (measurements where measured throughput > required throughput)
+    (HTTP measurements where measured throughput >= regulatory required throughput)
     /
     (total valid throughput measurements)
     * 100
 
-The HTTP test file is fixed at 2 MB.
-
-2 MB * 8 = 16 megabits
-
-Therefore:
-
-    throughput_mbps = 16 / duration_seconds
-
-where:
-
-    duration_seconds = test_end_time - test_start_time
-
-The comparison is strictly:
-
-    throughput_mbps > debit_exige_mbps
+Required throughput thresholds by technology:
+    - 4G: 30 Mbps (File size: 225 Mo)
+    - 3G: 10 Mbps (File size: 20 Mo)
 
 Grouping:
     (secteur, operator, technology)
 """
 
-from sqlalchemy import select, func, extract
+from sqlalchemy import select, func
 
 from app.kpi_engine.base import (
     BaseKPI,
@@ -36,11 +24,17 @@ from app.kpi_engine.base import (
     register_kpi,
 )
 from app.models.raw_data import TestHTTPAttempt
-from app.models.config_models import TechnologyThreshold
 
 
-FILE_SIZE_MB = 2.0
-FILE_SIZE_MEGABITS = FILE_SIZE_MB * 8.0
+FILE_SIZES_MB = {
+    "4G": 225.0,
+    "3G": 20.0,
+}
+
+REQUIRED_THROUGHPUT_MBPS = {
+    "4G": 30.0,
+    "3G": 10.0,
+}
 
 
 @register_kpi
@@ -48,59 +42,30 @@ class TDKpi(BaseKPI):
     name = "TD"
 
     def compute(self, context: KPIContext) -> KPIComputationResult:
-
         db = context.db
 
-        # Required throughput for this technology
-        threshold_row = (
-            db.query(TechnologyThreshold)
-            .filter_by(technology=context.technology)
-            .one_or_none()
-        )
+        tech_key = (context.technology or "").upper()
 
-        if (
-            threshold_row is None
-            or threshold_row.debit_exige_mbps is None
-        ):
+        # If technology is not found in mapping, do not fall back; return 0/is_computed=False
+        if tech_key not in FILE_SIZES_MB or tech_key not in REQUIRED_THROUGHPUT_MBPS:
             return KPIComputationResult(
                 value=None,
-                numerator=None,
-                denominator=None,
+                numerator=0,
+                denominator=0,
                 is_computed=False,
             )
-
-        debit_exige_mbps = threshold_row.debit_exige_mbps
 
         filters = [
             TestHTTPAttempt.secteur_id == context.secteur_id,
             TestHTTPAttempt.operator == context.operator,
             TestHTTPAttempt.technology == context.technology,
-
-            # Reverted: the live DB is back on `time`, not
-            # `test_start_time` (restored from a backup that predates
-            # that rename) - this filter and the duration calc below
-            # both need to match.
-            TestHTTPAttempt.time.is_not(None),
-            TestHTTPAttempt.test_end_time.is_not(None),
-
-            # End must be after start
-            TestHTTPAttempt.test_end_time > TestHTTPAttempt.time,
+            TestHTTPAttempt.download_duration_seconds.is_not(None),
+            TestHTTPAttempt.download_duration_seconds > 0,
         ]
-
-        # Duration in seconds
-        duration_seconds = (
-            extract(
-                "epoch",
-                TestHTTPAttempt.test_end_time
-                - TestHTTPAttempt.time,
-            )
-        )
 
         # Total valid throughput measurements
         total = db.execute(
-            select(func.count(TestHTTPAttempt.id)).where(
-                *filters
-            )
+            select(func.count(TestHTTPAttempt.id)).where(*filters)
         ).scalar_one()
 
         if total == 0:
@@ -111,26 +76,18 @@ class TDKpi(BaseKPI):
                 is_computed=False,
             )
 
-        # Throughput:
-        #
-        # 16 megabits / duration
-        #
-        # throughput > required
-        #
-        # 16 / duration > required
-        #
-        # equivalent to:
-        #
-        # duration < 16 / required
+        file_size_mb = FILE_SIZES_MB[tech_key]
+        file_size_megabits = file_size_mb * 8.0
+        required_mbps = REQUIRED_THROUGHPUT_MBPS[tech_key]
 
-        max_duration_for_success = (
-            FILE_SIZE_MEGABITS / debit_exige_mbps
-        )
+        max_allowed_duration = file_size_megabits / required_mbps
 
+        # Success = measurements where the download duration is fast enough
+        # to meet or exceed the regulatory throughput threshold.
         success = db.execute(
             select(func.count(TestHTTPAttempt.id)).where(
                 *filters,
-                duration_seconds < max_duration_for_success,
+                TestHTTPAttempt.download_duration_seconds <= max_allowed_duration,
             )
         ).scalar_one()
 

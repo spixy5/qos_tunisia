@@ -3,8 +3,8 @@ import { uploadFile } from '../api/client'
 
 const LOG_TYPES = [
   { value: 'rsrp', label: 'RSRP (mesures signal)' },
-  { value: 'http_attempt', label: 'HTTP - tentatives (succes)' },
-  { value: 'http_failure', label: 'HTTP - echecs' },
+  { value: 'http_attempt', label: 'HTTP - tentatives' },
+  
 ]
 const OPERATORS = [
   { value: 'TT', label: 'Tunisie Telecom' },

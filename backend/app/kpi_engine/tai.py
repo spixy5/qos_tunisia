@@ -3,38 +3,19 @@ TAI = Taux d'Accessibilite Internet Indoor
 
 TAI =
     (successful outdoor HTTP measurements with estimated indoor RSRP
-     >= configured threshold)
+     >= configured threshold, based on time difference < 10 seconds)
     /
     (total outdoor HTTP measurements)
     * 100
 
 For each HTTP attempt:
-
-1. The HTTP test must have test_status = "Success".
+1. Instead of relying solely on test_status = 'Success', success is defined
+   by checking that (test_end_time - test_start_time) < 10 seconds.
 2. The HTTP serving_band identifies the band to evaluate.
-3. Find an RSRP measurement:
-       - same secteur
-       - same operator
-       - same band
-       - "same position" means within POSITION_TOLERANCE_METERS (see
-         below), using the existing geom columns via ST_DWithin
-         (geography cast, so the distance is in real meters, not degrees).
-       - within +/- 1 second
-4. If several RSRP rows match, choose the closest in time.
-5. Get taux_aff and tai_threshold from config_band_thresholds.
-6. Estimate indoor RSRP:
-
-       indoor_rsrp = outdoor_rsrp + taux_aff
-
-7. Success if:
-
-       indoor_rsrp >= tai_threshold
-
-The denominator remains ALL HTTP outdoor measurements in the
-(secteur, operator, technology) group.
-
-The HTTP technology is NOT used when matching the RSRP row.
-The technology is still used to separate KPI groups.
+3. Find an RSRP measurement within TIME_TOLERANCE_SECONDS matching
+   secteur, operator, and band.
+4. Estimate indoor RSRP: indoor_rsrp = outdoor_rsrp + taux_aff
+5. Success if: indoor_rsrp >= tai_threshold AND time difference < 10 seconds.
 """
 
 from sqlalchemy import text
@@ -46,13 +27,14 @@ from app.kpi_engine.base import (
     register_kpi,
 )
 
-POSITION_TOLERANCE_METERS = 30
+TIME_TOLERANCE_SECONDS = 60
 
 _QUERY = text("""
     WITH matched AS (
         SELECT
             ha.id AS attempt_id,
-            ha.test_status,
+            ha.test_start_time,
+            ha.test_end_time,
             ha.serving_band,
 
             nearest.best_rsrp,
@@ -68,35 +50,14 @@ _QUERY = text("""
             FROM test_rsrp r
 
             WHERE r.secteur_id = ha.secteur_id
-
-              -- Operator must match
               AND r.operator = ha.operator
-
-              -- HTTP serving_band must match RSRP band, tolerant of
-              -- either the prefixed ('L1800') or bare ('1800') convention.
               AND regexp_replace(r.band, '^[^0-9]*', '') = regexp_replace(ha.serving_band, '^[^0-9]*', '')
-
-              -- "same position" via real distance instead of exact float
-              -- equality - geom is already a geography-castable PostGIS
-              -- column on both tables, ST_DWithin uses the spatial index
-              -- if present.
-              AND ST_DWithin(
-                    r.geom::geography,
-                    ha.geom::geography,
-                    :position_tolerance_m
-              )
-
-              -- Time matching window
-              -- REVERTED: back to ha.time (not ha.test_start_time) - the
-              -- live DB was restored from a backup that predates that
-              -- rename, so TestHTTPAttempt.time is the real column again.
               AND r.time BETWEEN
-                    ha.time - INTERVAL '1 second'
-                AND ha.time + INTERVAL '1 second'
+                    ha.test_start_time - (:time_tolerance_s || ' seconds')::INTERVAL
+                AND ha.test_start_time + (:time_tolerance_s || ' seconds')::INTERVAL
 
-            -- If multiple rows match, choose the closest in time
             ORDER BY ABS(
-                EXTRACT(EPOCH FROM (r.time - ha.time))
+                EXTRACT(EPOCH FROM (r.time - ha.test_start_time))
             )
 
             LIMIT 1
@@ -106,11 +67,8 @@ _QUERY = text("""
         WHERE ha.secteur_id = :secteur_id
           AND ha.operator = :operator
           AND ha.technology = :technology
-          -- Skip rows with no recorded test_status entirely (both
-          -- numerator and denominator) instead of counting them as
-          -- failures. These are pre-migration/legacy rows that never had
-          -- this field at all - there's no real "outcome" to judge.
-          AND ha.test_status IS NOT NULL
+          AND ha.test_start_time IS NOT NULL
+          AND ha.test_end_time IS NOT NULL
     )
 
     SELECT
@@ -118,7 +76,7 @@ _QUERY = text("""
 
         COUNT(*) FILTER (
             WHERE
-                LOWER(TRIM(m.test_status)) = 'success'
+                EXTRACT(EPOCH FROM (m.test_end_time - m.test_start_time)) < 10
 
                 AND m.best_rsrp IS NOT NULL
                 AND m.band IS NOT NULL
@@ -147,7 +105,7 @@ class TAIKpi(BaseKPI):
                 "secteur_id": context.secteur_id,
                 "operator": context.operator,
                 "technology": context.technology,
-                "position_tolerance_m": POSITION_TOLERANCE_METERS,
+                "time_tolerance_s": TIME_TOLERANCE_SECONDS,
             },
         ).one()
 

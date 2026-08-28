@@ -187,11 +187,11 @@ def raw_logs(level: str = Query(..., pattern="^(gouvernorat|delegation|secteur)$
             elif result == "Fail" or log_type == "http_failure":
                 attempt_q = attempt_q.filter(func.lower(func.trim(TestHTTPAttempt.test_status)) == "fail")
 
-            for r in attempt_q.order_by(TestHTTPAttempt.time.desc()).limit(remaining).all():
+            for r in attempt_q.order_by(TestHTTPAttempt.test_start_time.desc()).limit(remaining).all():
                 is_success = (r.test_status or "").strip().lower() == "success"
                 results.append({
                     "id": f"attempt_{r.id}", "logType": "http_attempt",
-                    "timestamp": r.time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "timestamp": r.test_start_time.strftime("%Y-%m-%d %H:%M:%S"),
                     "operator": r.operator, "technology": r.technology, "secteurName": secteur_name(r.secteur_id),
                     "rsrp": None,
                     "httpStatusLabel": "Succes" if is_success else (r.test_status or "Echec (cause inconnue)"),

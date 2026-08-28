@@ -1,10 +1,12 @@
-"""
-Central application settings, loaded from environment variables (.env supported).
-Nothing business-specific lives here (KPI thresholds live in the DB / config/ json
-so they can be edited by the Admin at runtime) - this file is purely infra config.
-"""
-from pydantic_settings import BaseSettings
 from pathlib import Path
+from pydantic_settings import BaseSettings
+
+# Looking at your folder tree: config.py is inside backend/app/core/config.py
+# Let's map parents accurately:
+# .parent = core
+# .parent.parent = app
+# .parent.parent.parent = backend (which contains geo_data and file_archive)
+BASE_DIR = Path(__file__).resolve().parent.parent.parent /"backend"
 
 
 class Settings(BaseSettings):
@@ -17,14 +19,12 @@ class Settings(BaseSettings):
     jwt_expire_minutes: int = 60 * 8  # 8h session
 
     # --- File archiving ---
-    # Root of the local archive hierarchy:
-    # /{archive_root}/tunisie/{gouvernorat}/{delegation}/{secteur}/{type_de_test}/{technologie}/
-    archive_root: Path = Path("./file_archive")
+    archive_root: Path = BASE_DIR / "file_archive"
 
     # --- Geo reference data ---
-    geojson_admin2_path: Path = Path("./geo_data/tun_admin2.geojson")  # Gouvernorat
-    geojson_admin3_path: Path = Path("./geo_data/tun_admin3.geojson")  # Delegation
-    geojson_admin4_path: Path = Path("./geo_data/tun_admin4.geojson")  # Secteur
+    geojson_admin2_path: Path = BASE_DIR / "geo_data" / "tun_admin2.geojson"
+    geojson_admin3_path: Path = BASE_DIR / "geo_data" / "tun_admin3.geojson"
+    geojson_admin4_path: Path = BASE_DIR / "geo_data" / "tun_admin4.geojson"
 
     # --- CORS ---
     frontend_origin: str = "http://localhost:5173"
