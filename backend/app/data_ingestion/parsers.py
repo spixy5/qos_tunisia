@@ -4,19 +4,28 @@ with each other - the radio team's export tool produces different column
 names/sets from export to export (different field selections, different
 tool versions, English/French labels, etc).
 
-HTTP attempt files in particular are handled with an ALIAS-BASED approach:
-each standardized field (time, latitude, longitude, ...) is matched
-independently against a list of known raw-column aliases, instead of
-trying to detect one fixed "format" for the whole file. This means any
-combination of aliases can appear in a given export and still be parsed
-correctly. To support a brand-new column name in the future, add it to
-the relevant list in HTTP_ATTEMPT_ALIASES below - no other logic needs
-to change.
+HTTP files are handled with an ALIAS-BASED approach: each standardized
+field (time, latitude, longitude, status, ...) is matched independently
+against a list of known raw-column aliases, instead of trying to detect
+one fixed "format" for the whole file. This means any combination of
+aliases can appear in a given export and still be parsed correctly. To
+support a brand-new column name in the future, add it to the relevant
+list in HTTP_ALIASES below - no other logic needs to change.
 
-RSRP and HTTP failure files still use the original rename-map / header-
-recovery approach, since only HTTP attempt exports have shown this kind
-of variation so far. If they start varying too, the same alias-based
-pattern used below can be applied to them.
+NOTE (2026-08): the radio team's export tool now produces ONE http file
+containing both successful and failed tests, distinguished by a
+"Test status" column (values: "Success" / "Failure"), instead of two
+separate exports. `read_http()` (formerly `read_http_attempt` +
+`read_http_failure`) handles both shapes: old-style attempt-only files
+(no failure-specific columns), old-style failure-only files (the
+malformed-header case), and the new unified file. Downstream, all rows
+- success and failure - are written to a single `test_http_attempt`
+table with a `status` column; there is no more per-outcome table split.
+
+RSRP files still use the original rename-map / header-recovery approach,
+since only HTTP exports have shown this kind of variation so far. If
+they start varying too, the same alias-based pattern used below can be
+applied to them.
 """
 import logging
 from pathlib import Path
@@ -25,6 +34,9 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
+# Column order used only as a last-resort positional fallback when a
+# file's header row failed to parse (see _recover_headerless_http below).
+# This is the superset of columns seen in old-style http_failure exports.
 EXPECTED_HTTP_FAILURE_COLUMNS = [
     "Event ID", "event", "Event#", "measurement", "Time", "System", "Serving band",
     "Data transfer address", "Redirect address", "Application protocol",
@@ -52,6 +64,7 @@ def _read_excel_or_csv(file_path: Path) -> pd.DataFrame:
     if file_path.suffix.lower() == ".csv":
         return pd.read_csv(file_path)
     return pd.read_excel(file_path)
+
 
 def read_rsrp(file_path: Path, operator: str, technology: str | None) -> pd.DataFrame:
     df = _read_excel_or_csv(file_path)
@@ -120,8 +133,12 @@ def read_rsrp(file_path: Path, operator: str, technology: str | None) -> pd.Data
     df["operator"] = operator
     df["technology"] = technology
     return df
+
+
 # ---------------------------------------------------------------------
-# Column alias groups for HTTP attempt files.
+# Column alias groups for HTTP files (attempt / success / failure - all
+# now come from the same export shape, distinguished only by the
+# "test_status" value).
 #
 # The radio team's export tool changes column names between exports
 # (different field selections, different tool versions, French/English
@@ -132,24 +149,39 @@ def read_rsrp(file_path: Path, operator: str, technology: str | None) -> pd.Data
 #
 # Matching is case-insensitive and ignores leading/trailing whitespace.
 # ---------------------------------------------------------------------
-HTTP_ATTEMPT_ALIASES: dict[str, list[str]] = {
+HTTP_ALIASES: dict[str, list[str]] = {
     "latitude": ["Test start latitude", "Latitude", "Lat.", "Lat"],
     "longitude": ["Test start longitude", "Longitude", "Lon.", "Lon", "Long."],
     "time": ["Test start time", "Time"],
     "test_end_time": ["Test end time"],
-    "test_status": ["Test status"],
+    # Success/Failure outcome of the test. Was implicit in which file you
+    # uploaded (http_success.xlsx vs http_failure.xlsx); now it's an
+    # explicit column ("Test status") in a single combined export. The old
+    # failure-only export also had a "Status" column meaning the same thing.
+    # Canonical name matches the existing `test_status` column on
+    # test_http_attempt - no translation layer needed at load time.
+    "test_status": ["Test status", "Status"],
     "application_protocol": [
         "Test protocol", "Application protocol", "Mode(Application protocol)",
     ],
     "start_system_band_raw": ["Start system and band"],
     "end_system_and_band": ["End system and band"],
     "best_rsrp": ["Avg(1. best RSRP)", "AvgRSRP", "1. best RSRP", "best RSRP"],
+    "best_rscp": ["AvgRSCP", "Avg(RSCP)", "RSCP"],
     "channel": ["Mode(Ch)", "Ch"],
     "pci": ["Mode(PCI)", "PCI"],
     "event_id": ["Event ID", "Mode(Event ID)"],
+    "event_label": ["event"],
+    "event_number": ["Event#"],
+    "measurement": ["measurement"],
     "system": ["System", "Mode(System)"],
     "serving_band": ["Serving band", "Mode(Serving band)"],
     "data_transfer_address": ["Data transfer address", "Mode(IP)"],
+    "redirect_address": ["Redirect address"],
+    "data_transfer_security_protocol": ["Data transfer security protocol"],
+    "data_transfer_authentication_scheme": ["Data transfer authentication scheme"],
+    "data_transfer_description": ["Data transfer description"],
+    "failure_cause": ["Failure cause"],
     "connection_timeout_raw": [
         "Data transfer connection timeout", "Mode(Connection timeout)",
     ],
@@ -177,7 +209,7 @@ def _build_alias_rename_map(columns, alias_groups: dict[str, list[str]]) -> dict
                 # the alias table above, not in the uploaded file.
                 raise ValueError(
                     f"Alias '{alias}' is mapped to both "
-                    f"'{lookup[key]}' and '{canonical}' - fix HTTP_ATTEMPT_ALIASES."
+                    f"'{lookup[key]}' and '{canonical}' - fix HTTP_ALIASES."
                 )
             lookup[key] = canonical
 
@@ -228,16 +260,71 @@ def _parse_system_and_band(value):
     return system, serving_band
 
 
-def read_http_attempt(
+def _normalize_status(value):
+    """'success' / 'SUCCESS' / ' Success ' -> 'Success'; same for Failure.
+    Anything else is passed through title-cased so odd values are still
+    visible in the DB rather than silently dropped."""
+    if pd.isna(value):
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    lowered = text.lower()
+    if lowered.startswith("succ"):
+        return "Success"
+    if lowered.startswith("fail"):
+        return "Failure"
+    return text.title()
+
+
+def _recover_headerless_http(file_path: Path, df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Defends against the malformed-header case observed in
+    HTTP_FAILURE_TT4G_3G.xlsx, where the file's single data row was read as
+    the header (0 data rows resulted). If the detected header doesn't look
+    like a real header (e.g. contains a raw float timestamp instead of a
+    recognizable column name), we re-read with header=None and apply the
+    known column order positionally instead.
+    """
+    header_looks_valid = any(
+        isinstance(c, str) and c.strip().lower() in ("time", "test start time")
+        for c in df.columns
+    )
+    if header_looks_valid:
+        return df
+
+    logger.warning(
+        "%s: header row not detected (columns=%s) - re-reading positionally, "
+        "ADMIN SHOULD VERIFY this file's header row against a known-good export.",
+        file_path.name, list(df.columns),
+    )
+    df = pd.read_excel(file_path, header=None)
+    if len(df.columns) != len(EXPECTED_HTTP_FAILURE_COLUMNS):
+        raise ValueError(
+            f"{file_path.name}: column count {len(df.columns)} doesn't match the "
+            f"expected {len(EXPECTED_HTTP_FAILURE_COLUMNS)} for a headerless recovery - "
+            "cannot safely recover columns positionally. Please re-export with headers."
+        )
+    df.columns = EXPECTED_HTTP_FAILURE_COLUMNS
+    return df
+
+
+def read_http(
     file_path: Path,
     operator: str,
     technology: str | None
 ) -> pd.DataFrame:
     """
-    Handles any HTTP attempt export the radio team sends, regardless of
-    which columns are present, by matching each expected field
-    independently against a list of known aliases (HTTP_ATTEMPT_ALIASES)
-    instead of trying to detect one fixed "format".
+    Handles any HTTP export the radio team sends - attempts, successes,
+    and failures all included in the same file and distinguished by the
+    "status" field - regardless of which columns are present, by matching
+    each expected field independently against a list of known aliases
+    (HTTP_ALIASES) instead of trying to detect one fixed "format".
+
+    Every row (success or failure) is returned in a single DataFrame with
+    a `status` column ("Success" / "Failure" / whatever the file reported,
+    title-cased). There is no more splitting into separate success/failure
+    outputs - both are written to the same `test_http_attempt` table.
 
     To support a new export variant in the future: run
     `inspect_columns.py` on the new file, find which of its column
@@ -247,9 +334,30 @@ def read_http_attempt(
     df = _read_excel_or_csv(file_path)
     logger.info("%s: raw columns = %s", file_path.name, list(df.columns))
 
-    rename_map = _build_alias_rename_map(df.columns, HTTP_ATTEMPT_ALIASES)
+    df = _recover_headerless_http(file_path, df)
+    if pd.api.types.is_numeric_dtype(df.get("Time", pd.Series(dtype=object))):
+        # Headerless recovery can leave Time as a raw Excel serial number.
+        logger.warning(
+            "%s: 'Time' column recovered as raw Excel serial number - will convert "
+            "via origin=1899-12-30 below. Verify against the source file if precision matters.",
+            file_path.name,
+        )
+
+    rename_map = _build_alias_rename_map(df.columns, HTTP_ALIASES)
     df = df.rename(columns=rename_map)
     logger.info("%s: columns after alias rename = %s", file_path.name, list(df.columns))
+
+    # --- Test status -> normalized status -----------------------------
+    if "test_status" in df.columns:
+        df["test_status"] = df["test_status"].apply(_normalize_status)
+    else:
+        logger.warning(
+            "%s: no 'Test status'/'Status' column found - defaulting test_status to "
+            "'Unknown'. This file predates the unified success/failure export; verify "
+            "it's not an old attempt-only export missing outcome info.",
+            file_path.name,
+        )
+        df["test_status"] = "Unknown"
 
     # --- Start system and band -> system / serving_band -------------
     # Only derive from the combined text field if we don't already have
@@ -315,7 +423,7 @@ def read_http_attempt(
     missing = required - set(df.columns)
     if missing:
         raise ValueError(
-            f"{file_path.name}: HTTP attempt file missing expected columns "
+            f"{file_path.name}: HTTP file missing expected columns "
             f"after alias matching: {missing}. Raw columns were: "
             f"{list(_read_excel_or_csv(file_path).columns)}"
         )
@@ -347,87 +455,22 @@ def read_http_attempt(
     return df
 
 
-def read_http_failure(file_path: Path, operator: str, technology: str | None) -> pd.DataFrame:
-    """
-    Defends against the malformed-header case observed in
-    HTTP_FAILURE_TT4G_3G.xlsx, where the file's single data row was read as
-    the header (0 data rows resulted). If the detected header doesn't look
-    like a real header (e.g. contains a raw float timestamp instead of the
-    word 'Time'), we re-read with header=None and apply the known column
-    order positionally instead.
-    """
-    df = pd.read_excel(file_path)
-
-    header_looks_valid = "Time" in df.columns or any(
-        isinstance(c, str) and c.strip().lower() == "time" for c in df.columns
-    )
-
-    if not header_looks_valid:
-        logger.warning(
-            "%s: header row not detected (columns=%s) - re-reading positionally, "
-            "ADMIN SHOULD VERIFY this file's header row against a known-good export "
-            "like http_failure_TT4G.xlsx",
-            file_path.name, list(df.columns),
-        )
-        df = pd.read_excel(file_path, header=None)
-        if len(df.columns) != len(EXPECTED_HTTP_FAILURE_COLUMNS):
-            raise ValueError(
-                f"{file_path.name}: column count {len(df.columns)} doesn't match the "
-                f"expected {len(EXPECTED_HTTP_FAILURE_COLUMNS)} for an http_failure file - "
-                "cannot safely recover columns positionally. Please re-export with headers."
-            )
-        df.columns = EXPECTED_HTTP_FAILURE_COLUMNS
-
-        # Headerless reads lose the cell's datetime formatting, so a genuine
-        # timestamp can come back as a raw Excel serial number (e.g. 46223.487
-        # instead of a Timestamp). Detect and convert.
-        time_col = df["Time"]
-        if pd.api.types.is_numeric_dtype(time_col):
-            logger.warning(
-                "%s: 'Time' column recovered as raw Excel serial number - converting "
-                "via origin=1899-12-30. Verify this against the source file if precision matters.",
-                file_path.name,
-            )
-            df["Time"] = pd.to_datetime(time_col, unit="D", origin="1899-12-30")
-
-    df = df.rename(columns={
-        "Event ID": "event_id",
-        "event": "event_label",
-        "Event#": "event_number",
-        "measurement": "measurement",
-        "Time": "time",
-        "System": "system",
-        "Serving band": "serving_band",
-        "Data transfer address": "data_transfer_address",
-        "Redirect address": "redirect_address",
-        "Application protocol": "application_protocol",
-        "Status": "status",
-        "Failure cause": "failure_cause",
-        "Longitude": "longitude",
-        "Latitude": "latitude",
-        "technologie": "technology_from_file",
-        "operateur": "operator_from_file",
-    })
-
-    required = {"time", "latitude", "longitude"}
-    missing = required - set(df.columns)
-    if missing:
-        raise ValueError(f"HTTP failure file missing expected columns after rename: {missing}")
-    df = _coerce_time_column(df, file_path.name)
-
-    for extra in ("operator_from_file", "technology_from_file"):
-        if extra in df.columns:
-            df = df.drop(columns=[extra])
-
-    df["operator"] = operator
-    df["technology"] = technology
-    return df
+# Backward-compatible aliases: old code/log_types calling read_http_attempt
+# or read_http_failure now get the same unified parser. Remove these once
+# all callers have moved to log_type="http".
+read_http_attempt = read_http
+read_http_failure = read_http
 
 
 PARSERS = {
     "rsrp": read_rsrp,
-    "http_attempt": read_http_attempt,
-    "http_failure": read_http_failure,
+    "http": read_http,
+    # Deprecated log_types kept temporarily so in-flight uploads / saved
+    # dropdown selections don't break during rollout. Both now route to
+    # the same unified parser and both success and failure rows land in
+    # the same test_http_attempt table (see migration).
+    "http_attempt": read_http,
+    "http_failure": read_http,
 }
 
 
@@ -436,4 +479,3 @@ def parse_uploaded_file(file_path: Path, log_type: str, operator: str,
     if log_type not in PARSERS:
         raise ValueError(f"Unknown log_type '{log_type}', expected one of {list(PARSERS)}")
     return PARSERS[log_type](file_path, operator, technology)
-
