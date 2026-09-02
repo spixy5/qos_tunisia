@@ -16,6 +16,23 @@ For each HTTP attempt:
    secteur, operator, and band.
 4. Estimate indoor RSRP: indoor_rsrp = outdoor_rsrp + taux_aff
 5. Success if: indoor_rsrp >= tai_threshold AND time difference < 10 seconds.
+
+FIX (see chat): the `matched` CTE used to filter out any attempt with a
+NULL test_end_time (i.e. every genuine test failure, which has no
+recorded end time by definition). That silently removed real failures
+from the DENOMINATOR too, not just the numerator - inflating TAI. The
+numerator's duration check already handles a NULL test_end_time
+correctly on its own (EXTRACT(...) < 10 evaluates to NULL/false for a
+NULL end time, so it's never counted as a success) - no separate
+exclusion was needed, and it was actively wrong to have one.
+
+FIX 2 (see chat): config_band_thresholds.taux_aff is stored as a
+positive attenuation LOSS in dB (observed values: 9-12, consistent with
+typical indoor penetration loss). The formula was
+`outdoor_rsrp + taux_aff`, which made the estimated indoor signal
+STRONGER than outdoor - backwards. Changed to
+`outdoor_rsrp - taux_aff` to correctly weaken the estimate. Note this
+makes TAI go DOWN, not up - it was previously making passes too easy.
 """
 
 from sqlalchemy import text
@@ -68,7 +85,11 @@ _QUERY = text("""
           AND ha.operator = :operator
           AND ha.technology = :technology
           AND ha.test_start_time IS NOT NULL
-          AND ha.test_end_time IS NOT NULL
+          -- Removed: "AND ha.test_end_time IS NOT NULL" - this was
+          -- silently dropping real failures from the denominator. A
+          -- failed test (no end time) should still count against TAI,
+          -- it just never counts as a success - which the numerator
+          -- filter below already guarantees on its own.
     )
 
     SELECT
@@ -76,13 +97,14 @@ _QUERY = text("""
 
         COUNT(*) FILTER (
             WHERE
-                EXTRACT(EPOCH FROM (m.test_end_time - m.test_start_time)) < 10
+                m.test_end_time IS NOT NULL
+                AND EXTRACT(EPOCH FROM (m.test_end_time - m.test_start_time)) < 10
 
                 AND m.best_rsrp IS NOT NULL
                 AND m.band IS NOT NULL
 
                 AND (
-                    m.best_rsrp + COALESCE(bt.taux_aff, 0)
+                    m.best_rsrp - COALESCE(bt.taux_aff, 0)
                 ) >= COALESCE(bt.tai_threshold, -100)
         ) AS success
 

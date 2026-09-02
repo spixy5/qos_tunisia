@@ -21,7 +21,17 @@ class TAOKpi(BaseKPI):
             TestHTTPAttempt.operator == context.operator,
             TestHTTPAttempt.technology == context.technology,
             TestHTTPAttempt.test_start_time.is_not(None),
-            TestHTTPAttempt.test_end_time.is_not(None),
+            # Removed: TestHTTPAttempt.test_end_time.is_not(None)
+            # Same bug as tai.py (see chat): a failed test has no
+            # test_end_time by definition, so this filter silently
+            # dropped real failures from the denominator instead of
+            # counting them as non-successes. The success filter below
+            # already excludes them correctly on its own - a NULL
+            # test_end_time makes time_diff NULL, and "NULL < 10" is
+            # NULL (not true), so it's never counted as a success.
+            # Both TAO and TAI need this fix together, or their
+            # denominators stop matching each other for the same
+            # underlying attempts.
         ]
 
         # Total HTTP outdoor measurements
@@ -45,6 +55,7 @@ class TAOKpi(BaseKPI):
         success = db.execute(
             select(func.count(TestHTTPAttempt.id)).where(
                 *filters,
+                TestHTTPAttempt.test_end_time.is_not(None),
                 time_diff < 10,
             )
         ).scalar_one()

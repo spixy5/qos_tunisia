@@ -11,7 +11,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent.parent /"backend"
 
 class Settings(BaseSettings):
     # --- Database ---
-    database_url: str = "postgresql+psycopg://postgres:user@localhost:5432/qos_tunisia"
+    database_url: str = "postgresql+psycopg://postgres:postgrespw@localhost:5432/qos_tunisia"
 
     # --- Auth ---
     jwt_secret_key: str = "f58e96d8eae80fd757db8bf400ae5e09233bb1077f68165f308f4e1c6a8ccff5"

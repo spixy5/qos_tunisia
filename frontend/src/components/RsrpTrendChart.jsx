@@ -50,7 +50,7 @@ export default function RsrpTrendChart({ level, id, operator }) {
             <XAxis dataKey="bucket" tick={{ fill: 'var(--text-muted)', fontSize: 11 }}
                    axisLine={{ stroke: 'var(--border)' }} tickLine={false} />
             <YAxis tick={{ fill: 'var(--text-muted)', fontSize: 12 }} axisLine={{ stroke: 'var(--border)' }}
-                   tickLine={false} domain={['dataMin - 5', 'dataMax + 5']} />
+                   tickLine={false} domain={[-120, 0]} />
             <Tooltip
               contentStyle={{ background: 'var(--bg-panel-raised)', border: '1px solid var(--border)', borderRadius: 6, fontSize: 12 }}
               labelStyle={{ color: 'var(--text-primary)' }}

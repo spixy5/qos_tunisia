@@ -48,8 +48,8 @@ export const getRawLogs = ({ level, id, operator, result, logType, limit }) =>
   api.get('/dashboard/raw-logs', { params: { level, id, operator, result, log_type: logType, limit } }).then((r) => r.data)
 export const getRsrpTrend = ({ level, id, operator, bucket }) =>
   api.get('/dashboard/rsrp-trend', { params: { level, id, operator, bucket } }).then((r) => r.data)
-export const getBadRsrpPoints = ({ level, id, operator }) =>
-  api.get('/dashboard/bad-rsrp-points', { params: { level, id, operator } }).then((r) => r.data)
+export const getBadRsrpPoints = ({ level, id, operator, technology }) =>
+  api.get('/dashboard/bad-rsrp-points', { params: { level, id, operator, technology } }).then((r) => r.data)
 
 // --- Admin: locations that actually have data (drives admin dropdowns) ---
 export const getDataGouvernorats = () => api.get('/admin/locations/gouvernorats').then((r) => r.data)

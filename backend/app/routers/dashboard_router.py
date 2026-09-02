@@ -21,6 +21,18 @@ router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 
 OPERATORS = ["TT", "OO", "OR"]
 
+# Shared level -> FK column mappings, used by raw-logs and bad-rsrp-points.
+LEVEL_FK_RSRP = {
+    "gouvernorat": TestRSRP.gouvernorat_id,
+    "delegation": TestRSRP.delegation_id,
+    "secteur": TestRSRP.secteur_id,
+}
+LEVEL_FK_ATTEMPT = {
+    "gouvernorat": TestHTTPAttempt.gouvernorat_id,
+    "delegation": TestHTTPAttempt.delegation_id,
+    "secteur": TestHTTPAttempt.secteur_id,
+}
+
 
 def _band_threshold(db: Session, band: str | None) -> BandThreshold | None:
     """TAI parameters are keyed by band only (no operator/technology
@@ -28,6 +40,17 @@ def _band_threshold(db: Session, band: str | None) -> BandThreshold | None:
     if band is None:
         return None
     return db.query(BandThreshold).filter_by(band=band).one_or_none()
+
+
+def _band_threshold_by_serving_band(db: Session, serving_band: str | None) -> BandThreshold | None:
+    """Resolve a threshold row from an HTTP attempt's serving_band field.
+    ASSUMPTION: serving_band values match BandThreshold.band values
+    exactly. Verify this holds for the new unified export format —
+    if serving_band uses a different naming scheme, this will always
+    miss and silently fall back to defaults (taux_aff=0.0, threshold=-100.0)."""
+    if serving_band is None:
+        return None
+    return db.query(BandThreshold).filter_by(band=serving_band).one_or_none()
 
 
 @router.get("/area-quality")
@@ -185,7 +208,13 @@ def raw_logs(level: str = Query(..., pattern="^(gouvernorat|delegation|secteur)$
             if result == "Pass":
                 attempt_q = attempt_q.filter(func.lower(func.trim(TestHTTPAttempt.test_status)) == "success")
             elif result == "Fail" or log_type == "http_failure":
-                attempt_q = attempt_q.filter(func.lower(func.trim(TestHTTPAttempt.test_status)) == "fail")
+                # FIXED: was checking == "fail", but the parser normalizes
+                # failed statuses to "Failure" (see _normalize_status),
+                # not "Fail" - "failure".lower() never equals "fail", so
+                # this filter matched zero rows even when real failures
+                # existed. Treat anything that isn't "success" as a
+                # failure instead, matching the is_success check below.
+                attempt_q = attempt_q.filter(func.lower(func.trim(TestHTTPAttempt.test_status)) != "success")
 
             for r in attempt_q.order_by(TestHTTPAttempt.test_start_time.desc()).limit(remaining).all():
                 is_success = (r.test_status or "").strip().lower() == "success"
@@ -205,46 +234,108 @@ def raw_logs(level: str = Query(..., pattern="^(gouvernorat|delegation|secteur)$
 @router.get("/bad-rsrp-points")
 def bad_rsrp_points(level: str = Query(..., pattern="^(gouvernorat|delegation|secteur)$"),
                      id: int = Query(...), operator: str | None = Query(None),
+                     technology: str | None = Query(None),
                      limit: int = Query(2000, le=5000),
                      db: Session = Depends(get_db), _: User = Depends(get_current_user)):
-    fk_col = {
-        "gouvernorat": TestRSRP.gouvernorat_id,
-        "delegation": TestRSRP.delegation_id,
-        "secteur": TestRSRP.secteur_id,
-    }[level]
+    """
+    Returns EVERY point (both passing and failing), not just failures -
+    each one tagged with status: "good" | "bad". Endpoint path/name kept
+    as-is (avoids a breaking frontend URL change) but the response shape
+    changed: previously this only ever returned failing points, so a
+    place with 100% quality correctly showed nothing on the map, which
+    looked broken even though it wasn't. Now the map can render both.
 
-    base_filters = [fk_col == id]
-    if operator and operator != "ALL":
-        base_filters.append(TestRSRP.operator == operator)
+    - RSRP rows: status "bad" if (best_rsrp + taux_aff) <= tai_threshold
+      for their resolved band, else "good".
+    - HTTP attempt rows: status "bad" if test_status is an explicit
+      failure, OR - when a signal reading is present (best_rsrp/best_rscp)
+      - it fails the same band-threshold check via serving_band. "good"
+      otherwise.
 
-    bands_present = (
-        db.query(TestRSRP.band).filter(*base_filters, TestRSRP.band.is_not(None)).distinct().all()
-    )
+    `operator`/`technology` are optional filters; omitted or "ALL" means
+    every operator/technology for this place.
+    """
+    rsrp_fk = LEVEL_FK_RSRP[level]
+    attempt_fk = LEVEL_FK_ATTEMPT[level]
 
     points = []
+
+    # --- RSRP points (both good and bad) ---------------------------------
+    rsrp_base_filters = [rsrp_fk == id]
+    if operator and operator != "ALL":
+        rsrp_base_filters.append(TestRSRP.operator == operator)
+    if technology and technology != "ALL":
+        rsrp_base_filters.append(TestRSRP.technology == technology)
+
+    bands_present = (
+        db.query(TestRSRP.band).filter(*rsrp_base_filters).distinct().all()
+    )
+
     for (band,) in bands_present:
-        threshold_row = _band_threshold(db, band)
+        if len(points) >= limit:
+            break
+        threshold_row = _band_threshold(db, band) if band is not None else None
         taux_aff = threshold_row.taux_aff if threshold_row else 0.0
         threshold = threshold_row.tai_threshold if threshold_row else -100.0
 
-        band_filters = base_filters + [
-            TestRSRP.band == band,
-            (TestRSRP.best_rsrp + taux_aff) <= threshold,
-        ]
+        band_filters = list(rsrp_base_filters)
+        if band is not None:
+            band_filters.append(TestRSRP.band == band)
+        else:
+            band_filters.append(TestRSRP.band.is_(None))
+
         rows = (
             db.query(TestRSRP.latitude, TestRSRP.longitude, TestRSRP.best_rsrp,
                      TestRSRP.operator, TestRSRP.technology)
             .filter(*band_filters)
+            .filter(TestRSRP.latitude.is_not(None), TestRSRP.longitude.is_not(None))
             .limit(limit - len(points))
             .all()
         )
-        points.extend(
-            {"lat": r.latitude, "lon": r.longitude, "rsrp": r.best_rsrp,
-             "operator": r.operator, "technology": r.technology}
-            for r in rows
+        for r in rows:
+            passed = (r.best_rsrp + taux_aff) > threshold
+            points.append({
+                "lat": r.latitude, "lon": r.longitude, "rsrp": r.best_rsrp,
+                "operator": r.operator, "technology": r.technology, "logType": "rsrp",
+                "status": "good" if passed else "bad",
+            })
+
+    # --- HTTP attempt points (both good and bad) --------------------------
+    if len(points) < limit:
+        attempt_base_filters = [attempt_fk == id]
+        if operator and operator != "ALL":
+            attempt_base_filters.append(TestHTTPAttempt.operator == operator)
+        if technology and technology != "ALL":
+            attempt_base_filters.append(TestHTTPAttempt.technology == technology)
+
+        attempt_rows = (
+            db.query(TestHTTPAttempt)
+            .filter(*attempt_base_filters)
+            .filter(TestHTTPAttempt.latitude.is_not(None), TestHTTPAttempt.longitude.is_not(None))
+            .limit(limit - len(points))
+            .all()
         )
-        if len(points) >= limit:
-            break
+
+        for r in attempt_rows:
+            if len(points) >= limit:
+                break
+
+            is_explicit_fail = (r.test_status or "").strip().lower() not in ("success", "")
+            signal = r.best_rsrp if r.best_rsrp is not None else r.best_rscp
+
+            is_bad_signal = False
+            if signal is not None:
+                threshold_row = _band_threshold_by_serving_band(db, r.serving_band)
+                taux_aff = threshold_row.taux_aff if threshold_row else 0.0
+                threshold = threshold_row.tai_threshold if threshold_row else -100.0
+                is_bad_signal = (signal + taux_aff) <= threshold
+
+            is_bad = is_explicit_fail or is_bad_signal
+            points.append({
+                "lat": r.latitude, "lon": r.longitude, "rsrp": signal,
+                "operator": r.operator, "technology": r.technology, "logType": "http_attempt",
+                "status": "bad" if is_bad else "good",
+            })
 
     return points[:limit]
 

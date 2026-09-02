@@ -5,10 +5,27 @@ import { useTheme } from '../context/ThemeContext.jsx'
 
 const TUNISIA_CENTER = [34.0, 9.5]
 
-// quality_pct is 0-100 (share of RSRP samples passing best_rsrp+Taux_aff>seuil).
-// Red (0) -> yellow (50) -> green (100).
+const CARTO_API_KEY = import.meta.env.VITE_CARTO_API_KEY
+
+if (!CARTO_API_KEY) {
+  console.error(
+    'VITE_CARTO_API_KEY is not set - CARTO basemap tiles will show the ' +
+    '"API key required" watermark. Check your .env file and restart the dev server.'
+  )
+}
+
+// CHANGED: the backend now returns EVERY point (good and bad), not just
+// failures - so color needs to reflect `status`, not `logType`. Coloring
+// by logType meant a 100%-quality secteur rendered as a solid red line
+// (all points were "rsrp", none were actually bad). `logType` is still
+// used for the type filter buttons, just not for point color anymore.
+export const STATUS_COLORS = {
+  good: '#3dd68c',  // green
+  bad: '#e5484d',   // red - unchanged from before
+}
+
 function qualityColor(pct) {
-  if (pct === null || pct === undefined) return '#5b6673' // no data - neutral gray
+  if (pct === null || pct === undefined) return '#5b6673'
   const t = Math.max(0, Math.min(1, pct / 100))
   let r, g
   if (t < 0.5) {
@@ -25,12 +42,12 @@ export const LAYERS = {
   auto: {
     dark: {
       label: 'Sombre',
-      url: 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
+      url: `https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png?key=${CARTO_API_KEY}`,
       attribution: '&copy; OpenStreetMap &copy; CARTO',
     },
     light: {
       label: 'Clair',
-      url: 'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png',
+      url: `https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png?key=${CARTO_API_KEY}`,
       attribution: '&copy; OpenStreetMap &copy; CARTO',
     },
   },
@@ -58,19 +75,19 @@ function FitToBounds({ geojson }) {
 }
 
 /**
- * Layer choice and the bad-RSRP-points toggle are now CONTROLLED props
- * (owned by the parent, rendered in a separate MapControlsPanel) rather
- * than internal state with floating buttons on the map itself - keeps the
- * map surface uncluttered.
+ * Layer choice, the points toggle, and the points-type filter are all
+ * CONTROLLED props (owned by the parent, rendered in a separate
+ * MapControlsPanel) rather than internal state.
  */
 export default function MapView({
-  secteurId, delegationId, gouvernoratId, operator = 'ALL', height = 320,
+  secteurId, delegationId, gouvernoratId, operator = 'ALL', technology, height = 320,
   layerKey = 'auto', showBadPoints = true, onBadPointsChange,
+  pointsFilter = 'all',
 }) {
   const { theme } = useTheme()
   const [geojson, setGeojson] = useState(null)
   const [quality, setQuality] = useState(null)
-  const [badPoints, setBadPoints] = useState([])
+  const [points, setPoints] = useState([])
 
   const level = secteurId ? 'secteur' : delegationId ? 'delegation' : gouvernoratId ? 'gouvernorat' : null
   const id = secteurId || delegationId || gouvernoratId || null
@@ -82,22 +99,39 @@ export default function MapView({
 
   useEffect(() => {
     if (!level) { setQuality(null); return }
-    getAreaQuality({ level, id, operator }).then(setQuality).catch(() => setQuality(null))
-  }, [level, id, operator])
+    getAreaQuality({ level, id, operator, technology }).then(setQuality).catch(() => setQuality(null))
+  }, [level, id, operator, technology])
 
   useEffect(() => {
     if (!level) {
-      setBadPoints([])
+      setPoints([])
       onBadPointsChange?.(0)
       return
     }
-    getBadRsrpPoints({ level, id, operator })
-      .then((pts) => { setBadPoints(pts); onBadPointsChange?.(pts.length) })
-      .catch(() => { setBadPoints([]); onBadPointsChange?.(0) })
-  }, [level, id, operator])
+    getBadRsrpPoints({ level, id, operator, technology })
+      .then((pts) => {
+        setPoints(pts)
+        // CHANGED: report the count of actually-BAD points, not the raw
+        // array length - the array now includes good points too, so the
+        // raw length no longer means "bad points" (this drives the
+        // "Points de mesure" badge count in MapControlsPanel).
+        const badCount = pts.filter((p) => p.status === 'bad').length
+        onBadPointsChange?.(badCount)
+      })
+      .catch(() => { setPoints([]); onBadPointsChange?.(0) })
+  }, [level, id, operator, technology])
 
   const activeLayer = layerKey === 'auto' ? LAYERS.auto[theme] : LAYERS[layerKey]
   const fillColor = qualityColor(quality?.quality_pct)
+
+  // logType filter still works exactly as before - just no longer tied
+  // to marker color.
+  const visiblePoints = pointsFilter === 'all'
+    ? points
+    : points.filter((p) => p.logType === pointsFilter)
+
+  const hasGoodAndBad = points.some((p) => p.status === 'good') &&
+    points.some((p) => p.status === 'bad')
 
   return (
     <div className="panel" style={{ height, overflow: 'hidden', position: 'relative', zIndex: 0 }}>
@@ -125,6 +159,22 @@ export default function MapView({
               ? `${quality.quality_pct}% (${quality.sample_count} echantillons)`
               : 'Pas de donnees RSRP'}
           </div>
+
+          {/* CHANGED: legend now explains point COLOR (good/bad), which
+              is what actually varies on the map now. Only shown when
+              both statuses are actually present. */}
+          {showBadPoints && hasGoodAndBad && (
+            <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 3 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                <span style={{ width: 8, height: 8, borderRadius: '50%', background: STATUS_COLORS.good }} />
+                <span>Bon</span>
+              </div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                <span style={{ width: 8, height: 8, borderRadius: '50%', background: STATUS_COLORS.bad }} />
+                <span>Mauvais</span>
+              </div>
+            </div>
+          )}
         </div>
       )}
 
@@ -148,14 +198,17 @@ export default function MapView({
           </>
         )}
 
-        {showBadPoints && badPoints.map((p, i) => (
-          <CircleMarker
-            key={i}
-            center={[p.lat, p.lon]}
-            radius={4}
-            pathOptions={{ color: 'var(--signal-poor)', fillColor: '#e5484d', fillOpacity: 0.85, weight: 1 }}
-          />
-        ))}
+        {showBadPoints && visiblePoints.map((p, i) => {
+          const color = STATUS_COLORS[p.status] || STATUS_COLORS.bad
+          return (
+            <CircleMarker
+              key={`${p.logType}-${p.status}-${i}`}
+              center={[p.lat, p.lon]}
+              radius={4}
+              pathOptions={{ color, fillColor: color, fillOpacity: 0.85, weight: 1 }}
+            />
+          )
+        })}
       </MapContainer>
     </div>
   )

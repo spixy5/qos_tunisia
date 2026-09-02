@@ -1,25 +1,36 @@
 import React, { useMemo } from 'react'
 import { PieChart, Pie, Cell, Tooltip, ResponsiveContainer, Legend } from 'recharts'
 
-const PALETTE = ['var(--signal-poor)', 'var(--signal-mid)', '#c77dff', '#5b8def', '#f472b6', '#facc15', 'var(--text-faint)']
-const MAX_SLICES = 6 // beyond this, remaining causes are grouped into "Autres"
+// NOTE: the source export only ever records a binary "Test status"
+// (Success / Fail - see parsers.py:_normalize_status). There is no
+// per-attempt failure-cause field anywhere upstream (checked the raw
+// exports and the DB: test_status is always exactly "Success" or
+// "Failure"), so a "cause breakdown" pie can only ever render one
+// slice. This chart now shows the real signal that exists - the
+// Succes/Echec split of HTTP attempts - instead of promising a
+// cause-level detail the data can't back up.
+const COLOR_BY_LABEL = {
+  Succes: 'var(--signal-good)',
+  Failure: 'var(--signal-poor)',
+}
+const FALLBACK_PALETTE = ['var(--signal-mid)', '#c77dff', '#5b8def', '#facc15', 'var(--text-faint)']
 
 export default function HttpFailureDonutChart({ logs, activeFilter, onCauseClick }) {
   const data = useMemo(() => {
     const counts = {}
     for (const log of logs) {
-      if (log.logType !== 'http_failure') continue
-      const cause = log.httpStatusLabel || 'Cause inconnue'
-      counts[cause] = (counts[cause] || 0) + 1
+      if (log.logType !== 'http_attempt' && log.logType !== 'http_failure') continue
+      const label = log.httpStatusLabel || 'Statut inconnu'
+      counts[label] = (counts[label] || 0) + 1
     }
-    const sorted = Object.entries(counts).sort((a, b) => b[1] - a[1])
-    const top = sorted.slice(0, MAX_SLICES)
-    const rest = sorted.slice(MAX_SLICES)
-    const restTotal = rest.reduce((s, [, v]) => s + v, 0)
-
-    const slices = top.map(([cause, value], i) => ({ cause, value, color: PALETTE[i % PALETTE.length] }))
-    if (restTotal > 0) slices.push({ cause: 'Autres causes', value: restTotal, color: PALETTE[PALETTE.length - 1] })
-    return slices
+    let fallbackIdx = 0
+    return Object.entries(counts)
+      .sort((a, b) => b[1] - a[1])
+      .map(([label, value]) => ({
+        cause: label,
+        value,
+        color: COLOR_BY_LABEL[label] || FALLBACK_PALETTE[fallbackIdx++ % FALLBACK_PALETTE.length],
+      }))
   }, [logs])
 
   const total = data.reduce((s, d) => s + d.value, 0)
@@ -27,14 +38,14 @@ export default function HttpFailureDonutChart({ logs, activeFilter, onCauseClick
 
   return (
     <div className="panel" style={{ padding: 20 }}>
-      <div className="eyebrow" style={{ marginBottom: 4 }}>Repartition des echecs HTTP (cause reelle)</div>
+      <div className="eyebrow" style={{ marginBottom: 4 }}>Repartition des tests HTTP (Succes / Echec)</div>
       <div style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 16 }}>
-        Cause exacte rapportee par le log (failure_cause), sans regroupement artificiel.
-        Cliquez une categorie pour filtrer le tableau.
+        Le statut brut du test (test_status) ne distingue que Succes/Echec - aucune cause
+        detaillee n'est fournie par l'export. Cliquez une categorie pour filtrer le tableau.
       </div>
       {total === 0 ? (
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: 260, color: 'var(--text-faint)', fontSize: 13 }}>
-          Aucun echec HTTP dans cette zone
+          Aucun test HTTP dans cette zone
         </div>
       ) : (
         <ResponsiveContainer width="100%" height={260}>

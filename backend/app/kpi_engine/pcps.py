@@ -16,9 +16,9 @@ the formula itself now, not admin-configurable (the old shared
 
 Depends on TAO, TAI, TD already being computed for the same combo -
 engine.py guarantees this via KPI_RUN_ORDER. Reports is_computed=False
-(no fabricated score) until all three are actually computed - currently
-that means PCPS stays "not computed" until TD.py is implemented for real
-(it's a placeholder returning None - see td.py).
+(no fabricated score) until all three are actually computed - so PCPS
+stays "not computed" for any combo where TD itself isn't computed (e.g.
+a "5G" campaign with no configured debit_exige_mbps yet - see td.py).
 """
 from app.kpi_engine.base import BaseKPI, KPIContext, KPIComputationResult, register_kpi
 
